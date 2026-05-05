@@ -1,9 +1,9 @@
 use crate::session::Session;
 use axum::extract::ws::{Message, WebSocket};
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[derive(Deserialize)]
 #[serde(tag = "t")]
@@ -14,18 +14,24 @@ enum ClientMsg {
     Resize { c: u16, r: u16 },
 }
 
-pub async fn handle(socket: WebSocket, session: Arc<Session>) {
+pub async fn handle(socket: WebSocket, session: Arc<Session>, init_cols: u16, init_rows: u16) {
+    let viewport_id = session.add_viewport(init_cols, init_rows).await;
     let mut rx = session.subscribe().await;
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // Ask the program inside the pane to redraw so the freshly-attached
-    // xterm grid converges to current state. Slight delay so xterm has
-    // finished reset() before bytes start arriving.
-    let session_for_nudge = session.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        session_for_nudge.nudge_redraw().await;
-    });
+    // Send a per-client snapshot to bring this xterm into sync with Claude's
+    // current state. Goes only to this WebSocket — other clients aren't
+    // affected.
+    match session.snapshot().await {
+        Ok(bytes) if !bytes.is_empty() => {
+            if ws_tx.send(Message::Binary(Bytes::from(bytes))).await.is_err() {
+                session.remove_viewport(viewport_id).await;
+                return;
+            }
+        }
+        Err(e) => tracing::warn!("snapshot failed: {:#}", e),
+        _ => {}
+    }
 
     let session_in = session.clone();
     let mut writer = tokio::spawn(async move {
@@ -45,6 +51,7 @@ pub async fn handle(socket: WebSocket, session: Arc<Session>) {
         }
     });
 
+    let session_for_reader = session.clone();
     let mut reader = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_rx.next().await {
             match msg {
@@ -55,9 +62,7 @@ pub async fn handle(socket: WebSocket, session: Arc<Session>) {
                         }
                     }
                     Ok(ClientMsg::Resize { c, r }) => {
-                        if let Err(e) = session_in.resize(c, r).await {
-                            tracing::warn!("resize: {:#}", e);
-                        }
+                        session_for_reader.update_viewport(viewport_id, c, r).await;
                     }
                     Err(e) => tracing::debug!("bad client msg: {}", e),
                 },
@@ -71,4 +76,6 @@ pub async fn handle(socket: WebSocket, session: Arc<Session>) {
         _ = &mut writer => { reader.abort(); }
         _ = &mut reader => { writer.abort(); }
     }
+
+    session.remove_viewport(viewport_id).await;
 }

@@ -1,16 +1,20 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
 use tokio::process::Command;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 
 const BROADCAST_CAP: usize = 1024;
 const READ_CHUNK: usize = 16 * 1024;
+
+static NEXT_VIEWPORT_ID: AtomicU64 = AtomicU64::new(1);
+pub type ViewportId = u64;
 
 pub struct Session {
     pub id: String,
@@ -23,8 +27,9 @@ pub struct Session {
 
 struct Inner {
     tx: broadcast::Sender<Bytes>,
-    cols: AtomicU16,
-    rows: AtomicU16,
+    pane_cols: AtomicU16,
+    pane_rows: AtomicU16,
+    viewports: Mutex<HashMap<ViewportId, (u16, u16)>>,
 }
 
 pub fn validate_id(id: &str) -> Result<()> {
@@ -64,6 +69,10 @@ impl Session {
             session_created_at(&tmux_name).await.unwrap_or_else(|_| now_secs())
         } else {
             let _ = tmux(&["set-option", "-g", "focus-events", "on"]).await;
+            // Big history-limit so the scrollback view has real history to show
+            // for shell sessions. (Claude TUI uses alt-screen; tmux doesn't
+            // record alt-screen scrollback regardless of this setting.)
+            let _ = tmux(&["set-option", "-g", "history-limit", "50000"]).await;
             let cols_s = cols.to_string();
             let rows_s = rows.to_string();
             tmux(&[
@@ -89,8 +98,9 @@ impl Session {
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
         let inner = Arc::new(Inner {
             tx,
-            cols: AtomicU16::new(cols),
-            rows: AtomicU16::new(rows),
+            pane_cols: AtomicU16::new(cols),
+            pane_rows: AtomicU16::new(rows),
+            viewports: Mutex::new(HashMap::new()),
         });
 
         let inner_for_task = inner.clone();
@@ -115,15 +125,109 @@ impl Session {
         self.inner.tx.subscribe()
     }
 
-    pub async fn nudge_redraw(&self) {
-        // Ctrl+L (0x0c, ANSI FF) is the standard "redraw screen" signal that
-        // most TUIs (including Claude Code) honor by emitting a full redraw.
-        // We rely on this instead of replaying historical bytes or sending a
-        // static capture-pane snapshot, both of which produce incoherent
-        // xterm state in long-running TUI sessions.
-        if let Err(e) = self.send_input(&[0x0c]).await {
-            tracing::warn!("nudge_redraw failed: {:#}", e);
+    /// Build a per-client snapshot to bring an attaching xterm into sync with
+    /// Claude's current state without broadcasting anything. We:
+    ///   - enter alt-screen if the pane is in alt-screen mode
+    ///   - clear and home
+    ///   - write each captured line at absolute row to avoid scroll
+    ///   - position the cursor where tmux says it is
+    /// Other clients are unaffected because this output goes to one WebSocket only.
+    pub async fn snapshot(&self) -> Result<Vec<u8>> {
+        let pane = Command::new("tmux")
+            .args([
+                "capture-pane", "-p", "-e",
+                "-t", &self.tmux_name,
+            ])
+            .output()
+            .await
+            .context("capture-pane")?;
+        if !pane.status.success() {
+            return Err(anyhow!(
+                "capture-pane: {}",
+                String::from_utf8_lossy(&pane.stderr).trim()
+            ));
         }
+        let info_out = Command::new("tmux")
+            .args([
+                "display-message", "-p", "-t", &self.tmux_name,
+                "#{cursor_y};#{cursor_x};#{alternate_on}",
+            ])
+            .output()
+            .await
+            .context("display-message")?;
+        let info = String::from_utf8_lossy(&info_out.stdout);
+        let parts: Vec<&str> = info.trim().split(';').collect();
+        let cy: u16 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let cx: u16 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let alt: bool = parts.get(2).map(|s| s.trim() == "1").unwrap_or(false);
+
+        let mut out = Vec::with_capacity(pane.stdout.len() + 256);
+        if alt {
+            out.extend_from_slice(b"\x1b[?1049h");
+        }
+        out.extend_from_slice(b"\x1b[2J\x1b[H");
+        let content = String::from_utf8_lossy(&pane.stdout);
+        for (i, line) in content.lines().enumerate() {
+            let row = i + 1;
+            out.extend_from_slice(format!("\x1b[{};1H", row).as_bytes());
+            out.extend_from_slice(line.as_bytes());
+        }
+        out.extend_from_slice(format!("\x1b[{};{}H", cy + 1, cx + 1).as_bytes());
+        Ok(out)
+    }
+
+    /// Smallest-bounding-box resize: register this viewport and apply
+    /// `min(cols)` × `min(rows)` across all attached viewports. Returns
+    /// the viewport id so the caller can update or remove later.
+    pub async fn add_viewport(&self, cols: u16, rows: u16) -> ViewportId {
+        let id = NEXT_VIEWPORT_ID.fetch_add(1, Ordering::Relaxed);
+        let mut vs = self.inner.viewports.lock().await;
+        vs.insert(id, (cols.max(2), rows.max(2)));
+        let (mc, mr) = compute_min(&vs);
+        drop(vs);
+        if let Err(e) = self.apply_pane_size(mc, mr).await {
+            tracing::warn!("add_viewport apply: {:#}", e);
+        }
+        id
+    }
+
+    pub async fn update_viewport(&self, id: ViewportId, cols: u16, rows: u16) {
+        let mut vs = self.inner.viewports.lock().await;
+        if !vs.contains_key(&id) {
+            return;
+        }
+        vs.insert(id, (cols.max(2), rows.max(2)));
+        let (mc, mr) = compute_min(&vs);
+        drop(vs);
+        if let Err(e) = self.apply_pane_size(mc, mr).await {
+            tracing::warn!("update_viewport apply: {:#}", e);
+        }
+    }
+
+    pub async fn remove_viewport(&self, id: ViewportId) {
+        let mut vs = self.inner.viewports.lock().await;
+        vs.remove(&id);
+        if vs.is_empty() {
+            return; // no clients — leave pane size as-is
+        }
+        let (mc, mr) = compute_min(&vs);
+        drop(vs);
+        if let Err(e) = self.apply_pane_size(mc, mr).await {
+            tracing::warn!("remove_viewport apply: {:#}", e);
+        }
+    }
+
+    async fn apply_pane_size(&self, cols: u16, rows: u16) -> Result<()> {
+        let pc = self.inner.pane_cols.swap(cols, Ordering::Relaxed);
+        let pr = self.inner.pane_rows.swap(rows, Ordering::Relaxed);
+        if pc == cols && pr == rows {
+            return Ok(());
+        }
+        tmux(&[
+            "resize-window", "-t", &self.tmux_name,
+            "-x", &cols.to_string(), "-y", &rows.to_string(),
+        ])
+        .await
     }
 
     pub async fn send_input(&self, data: &[u8]) -> Result<()> {
@@ -166,23 +270,6 @@ impl Session {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    pub async fn resize(&self, cols: u16, rows: u16) -> Result<()> {
-        let prev_cols = self.inner.cols.swap(cols, Ordering::Relaxed);
-        let prev_rows = self.inner.rows.swap(rows, Ordering::Relaxed);
-        if prev_cols == cols && prev_rows == rows {
-            return Ok(());
-        }
-        let cols_s = cols.to_string();
-        let rows_s = rows.to_string();
-        tmux(&[
-            "resize-window", "-t", &self.tmux_name,
-            "-x", &cols_s, "-y", &rows_s,
-        ])
-        .await
-        .context("tmux resize-window")?;
-        Ok(())
-    }
-
     pub async fn kill(&self) -> Result<()> {
         let _ = tmux(&["kill-session", "-t", &self.tmux_name]).await;
         let sock = PathBuf::from(format!("/tmp/disbot-{}.sock", self.id));
@@ -202,6 +289,25 @@ async fn read_loop(listener: UnixListener, inner: Arc<Inner>) -> Result<()> {
         }
         let chunk = Bytes::copy_from_slice(&buf[..n]);
         let _ = inner.tx.send(chunk);
+    }
+}
+
+/// Largest bounding box: pane size = max cols and max rows across all
+/// attached viewports. The largest client (typically a laptop) stays at its
+/// full size; smaller clients (typically phones) see content clipped to
+/// their own xterm grid. The opposite policy (smallest) makes the larger
+/// client shrink to fit the smaller — usually worse for everyone.
+fn compute_min(vs: &HashMap<ViewportId, (u16, u16)>) -> (u16, u16) {
+    let mut mc = 0u16;
+    let mut mr = 0u16;
+    for &(c, r) in vs.values() {
+        if c > mc { mc = c; }
+        if r > mr { mr = r; }
+    }
+    if mc == 0 || mr == 0 {
+        (80, 24)
+    } else {
+        (mc, mr)
     }
 }
 

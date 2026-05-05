@@ -379,7 +379,7 @@ async fn forward_output(bot: Bot, state: Arc<State>) {
         };
         let session_id = session.id.clone();
 
-        let (_, mut rx) = session.subscribe().await;
+        let mut rx = session.subscribe().await;
         let mut last_hash: u64 = 0;
         let mut activity_pending = false;
         let mut last_activity = Instant::now();

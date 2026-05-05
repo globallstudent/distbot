@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <title>disbot</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <style>
@@ -16,11 +16,13 @@
     --accent: #7fdb73;
     --accent-2: #d97757;
     --active: #2a3a55;
+    --keybar-h: 0px;
   }
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text);
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
     font: 13px ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; overflow: hidden; }
-  #term { position: absolute; inset: 0; padding: 6px; }
+  html, body { height: 100%; height: 100dvh; }
+  #term { position: absolute; left: 0; right: 0; top: 0; bottom: var(--keybar-h); padding: 6px; }
   #term .xterm { height: 100%; }
   #status {
     position: fixed; right: 10px; top: 8px; z-index: 30;
@@ -127,6 +129,36 @@
     background: transparent; color: var(--text); cursor: pointer; font-size: 12px;
   }
   #hist-bar button:hover { background: var(--panel-2); }
+
+  #keybar { display: none; }
+  @media (max-width: 768px) {
+    :root { --keybar-h: 46px; }
+    #status { display: none; }
+    #picker { bottom: calc(var(--keybar-h) + 8px); }
+    .corner-btn { padding: 7px 12px; font-size: 13px; }
+    dialog#new-modal { min-width: auto; width: calc(100vw - 24px); padding: 14px 14px; }
+    #hist-bar { padding: 8px 10px; gap: 6px; }
+    #hist-bar h2 { font-size: 12px; }
+    #hist-bar .info { display: none; }
+    #hist-pre { font-size: 11.5px; padding: 10px 12px; }
+
+    #keybar {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 35;
+      display: flex; gap: 4px; padding: 5px 5px;
+      background: rgba(18,18,18,0.95);
+      border-top: 1px solid var(--border);
+      backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+      padding-bottom: max(5px, env(safe-area-inset-bottom));
+    }
+    #keybar button {
+      flex: 1; min-width: 0; padding: 9px 0;
+      font: 13px ui-monospace, "SF Mono", Menlo, monospace;
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 5px;
+      cursor: pointer; touch-action: manipulation;
+    }
+    #keybar button:active { background: var(--active); border-color: var(--accent); }
+  }
 </style>
 </head>
 <body>
@@ -140,6 +172,17 @@
 </div>
 <div id="status">connecting…</div>
 <div id="term"></div>
+
+<div id="keybar" aria-label="keys">
+  <button type="button" tabindex="-1" data-key="ESC">esc</button>
+  <button type="button" tabindex="-1" data-key="TAB">tab</button>
+  <button type="button" tabindex="-1" data-key="CC">^C</button>
+  <button type="button" tabindex="-1" data-key="UP">↑</button>
+  <button type="button" tabindex="-1" data-key="DOWN">↓</button>
+  <button type="button" tabindex="-1" data-key="LEFT">←</button>
+  <button type="button" tabindex="-1" data-key="RIGHT">→</button>
+  <button type="button" tabindex="-1" data-key="END" title="end-of-line / accept zsh autosuggestion">↦</button>
+</div>
 
 <div id="hist-view" hidden>
   <div id="hist-bar">
@@ -386,15 +429,101 @@
   });
 
   let resizeTimer = 0;
-  window.addEventListener('resize', () => {
+  function scheduleRefit(delay = 80) {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       fit.fit();
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ t: 'r', c: term.cols, r: term.rows }));
       }
-    }, 80);
+    }, delay);
+  }
+  window.addEventListener('resize', () => scheduleRefit(80));
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', () => scheduleRefit(120));
+  }
+  window.addEventListener('orientationchange', () => scheduleRefit(200));
+
+  // Virtual key bar for mobile (esc, tab, ctrl+c, arrows).
+  const KEY_MAP = {
+    ESC: '\x1b',
+    TAB: '\x09',
+    CC: '\x03',
+    UP: '\x1b[A',
+    DOWN: '\x1b[B',
+    LEFT: '\x1b[D',
+    RIGHT: '\x1b[C',
+    END: '\x05',
+  };
+  const keybar = document.getElementById('keybar');
+  // mousedown.preventDefault keeps focus on xterm so the on-screen keyboard
+  // stays open. We do NOT preventDefault on touchstart because some mobile
+  // browsers then suppress the click event entirely.
+  keybar.addEventListener('mousedown', e => {
+    if (e.target.closest('button[data-key]')) e.preventDefault();
   });
+  function sendKey(key) {
+    const seq = KEY_MAP[key];
+    if (seq && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ t: 'i', d: seq }));
+    }
+  }
+  keybar.addEventListener('click', e => {
+    const btn = e.target.closest('button[data-key]');
+    if (!btn) return;
+    sendKey(btn.dataset.key);
+    term.focus();
+  });
+
+  // Manual touch scroll for xterm. xterm.js doesn't ship native touch
+  // scrolling, so on phones a swipe does nothing (or scrolls the page,
+  // which we've disabled). We translate touchmove deltas into
+  // term.scrollLines() so the buffer scrolls. Effective for shell sessions;
+  // alt-screen apps (Claude TUI) have no scrollback so this is a no-op there.
+  const termEl = document.getElementById('term');
+  let touchY = null;
+  let touchAccum = 0;
+  const rowPx = 14;
+  termEl.addEventListener('touchstart', e => {
+    if (e.touches.length === 1) {
+      touchY = e.touches[0].clientY;
+      touchAccum = 0;
+    }
+  }, { passive: true });
+  termEl.addEventListener('touchmove', e => {
+    if (e.touches.length !== 1 || touchY === null) return;
+    const y = e.touches[0].clientY;
+    touchAccum += touchY - y;
+    const lines = Math.trunc(touchAccum / rowPx);
+    if (lines !== 0) {
+      term.scrollLines(lines);
+      touchAccum -= lines * rowPx;
+    }
+    touchY = y;
+  }, { passive: true });
+  termEl.addEventListener('touchend', () => { touchY = null; });
+  termEl.addEventListener('touchcancel', () => { touchY = null; });
+
+  // Lift the keybar above the on-screen keyboard. We try the modern
+  // CSS approach first (interactive-widget=resizes-content in the viewport
+  // meta makes 100dvh and position:fixed work correctly). On platforms
+  // that don't honor it, we fall back to translating the keybar by the
+  // keyboard's height as reported by the visualViewport API.
+  function repositionKeybar() {
+    if (!window.visualViewport) return;
+    const vv = window.visualViewport;
+    const occluded = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+    // tiny epsilon — sub-pixel rounding shouldn't trigger
+    keybar.style.transform = occluded > 1 ? `translateY(-${occluded}px)` : '';
+    // also lift the picker pill so it stays above the keyboard
+    const pickerEl = document.getElementById('picker');
+    pickerEl.style.transform = occluded > 1 ? `translateY(-${occluded}px)` : '';
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', repositionKeybar);
+    window.visualViewport.addEventListener('scroll', repositionKeybar);
+    repositionKeybar();
+  }
 
   async function killSession(id) {
     if (!confirm(`kill session "${id}"?`)) return;

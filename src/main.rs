@@ -8,7 +8,7 @@ mod ws;
 use anyhow::Result;
 use axum::{
     extract::{Query, State, WebSocketUpgrade},
-    http::StatusCode,
+    http::{header, StatusCode},
     middleware,
     response::{Html, IntoResponse},
     routing::{delete, get},
@@ -103,7 +103,13 @@ async fn main() -> Result<()> {
 }
 
 async fn index() -> impl IntoResponse {
-    Html(INDEX_HTML)
+    (
+        [
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Html(INDEX_HTML),
+    )
 }
 
 async fn ws_handler(
@@ -121,10 +127,9 @@ async fn ws_handler(
                 .into_response();
         }
     };
-    if let (Some(c), Some(r)) = (params.cols, params.rows) {
-        let _ = session.resize(c, r).await;
-    }
-    ws.on_upgrade(move |socket| ws::handle(socket, session))
+    let cols = params.cols.unwrap_or(120);
+    let rows = params.rows.unwrap_or(40);
+    ws.on_upgrade(move |socket| ws::handle(socket, session, cols, rows))
 }
 
 fn disbot_state_dir() -> PathBuf {
