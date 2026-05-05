@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, Mutex};
 
 const BROADCAST_CAP: usize = 1024;
 const READ_CHUNK: usize = 16 * 1024;
+const HISTORY_CAP: usize = 50_000;
 
 static NEXT_VIEWPORT_ID: AtomicU64 = AtomicU64::new(1);
 pub type ViewportId = u64;
@@ -30,6 +31,15 @@ struct Inner {
     pane_cols: AtomicU16,
     pane_rows: AtomicU16,
     viewports: Mutex<HashMap<ViewportId, (u16, u16)>>,
+    /// Server-side virtual terminal that mirrors the pane state, used to
+    /// detect "scroll-via-redraw" so we can capture history that tmux can't
+    /// (alt-screen content scrolling within Claude TUI, etc.).
+    parser: Mutex<vt100::Parser>,
+    /// Last observed screen rows (plain text, trimmed). Comparing against
+    /// the current screen lets us see what content scrolled off the top.
+    last_rows: Mutex<Vec<String>>,
+    /// Bounded scrollback of rows that scrolled out of view.
+    history: Mutex<VecDeque<String>>,
 }
 
 pub fn validate_id(id: &str) -> Result<()> {
@@ -96,11 +106,16 @@ impl Session {
             .context("tmux pipe-pane")?;
 
         let (tx, _) = broadcast::channel(BROADCAST_CAP);
+        // vt100 scrollback length 0 — we manage our own scroll-out detection.
+        let parser = vt100::Parser::new(rows, cols, 0);
         let inner = Arc::new(Inner {
             tx,
             pane_cols: AtomicU16::new(cols),
             pane_rows: AtomicU16::new(rows),
             viewports: Mutex::new(HashMap::new()),
+            parser: Mutex::new(parser),
+            last_rows: Mutex::new(Vec::new()),
+            history: Mutex::new(VecDeque::new()),
         });
 
         let inner_for_task = inner.clone();
@@ -227,7 +242,30 @@ impl Session {
             "resize-window", "-t", &self.tmux_name,
             "-x", &cols.to_string(), "-y", &rows.to_string(),
         ])
-        .await
+        .await?;
+        {
+            let mut p = self.inner.parser.lock().await;
+            p.screen_mut().set_size(rows, cols);
+            // Last_rows captured at old size; clear so we don't false-positive
+            // a "scroll" on the next diff.
+            *self.inner.last_rows.lock().await = Vec::new();
+        }
+        Ok(())
+    }
+
+    /// Return the most recent `max_lines` rows from the captured scrollback
+    /// history (rows that scrolled off the top of the visible pane).
+    pub async fn history_text(&self, max_lines: usize) -> String {
+        let h = self.inner.history.lock().await;
+        let skip = h.len().saturating_sub(max_lines);
+        let mut out = String::new();
+        for (i, row) in h.iter().skip(skip).enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(row);
+        }
+        out
     }
 
     pub async fn send_input(&self, data: &[u8]) -> Result<()> {
@@ -288,8 +326,73 @@ async fn read_loop(listener: UnixListener, inner: Arc<Inner>) -> Result<()> {
             return Err(anyhow!("pipe-pane closed"));
         }
         let chunk = Bytes::copy_from_slice(&buf[..n]);
+        feed_parser_and_capture(&inner, &chunk).await;
         let _ = inner.tx.send(chunk);
     }
+}
+
+/// Feed the byte chunk to the virtual terminal parser, then look at the
+/// resulting screen and figure out whether content scrolled off the top
+/// since the last observation. If so, append those rows to the scrollback
+/// history. This is what makes Claude TUI history recoverable: Claude
+/// redraws the screen each time a new message appears, but our shift
+/// detection sees that the previous rows have moved up by N and captures
+/// the rows that fell off.
+async fn feed_parser_and_capture(inner: &Arc<Inner>, chunk: &[u8]) {
+    let curr_rows = {
+        let mut p = inner.parser.lock().await;
+        p.process(chunk);
+        screen_to_rows(p.screen())
+    };
+
+    let mut last = inner.last_rows.lock().await;
+    let prev_rows = std::mem::take(&mut *last);
+    *last = curr_rows.clone();
+    drop(last);
+
+    if prev_rows.is_empty() || prev_rows.len() != curr_rows.len() {
+        return;
+    }
+
+    if let Some(k) = detect_shift(&prev_rows, &curr_rows) {
+        let mut hist = inner.history.lock().await;
+        for row in &prev_rows[..k] {
+            hist.push_back(row.clone());
+            if hist.len() > HISTORY_CAP {
+                hist.pop_front();
+            }
+        }
+    }
+}
+
+fn screen_to_rows(screen: &vt100::Screen) -> Vec<String> {
+    let (rows, cols) = screen.size();
+    screen
+        .rows(0, cols)
+        .map(|s| s.trim_end().to_string())
+        .take(rows as usize)
+        .collect()
+}
+
+/// Find K such that the suffix `prev[K..]` matches the prefix `curr[..N-K]`,
+/// i.e. the screen has shifted up by K rows. Returns None if no shift is
+/// detected. K=0 (no shift) returns None — we only care about real scroll.
+fn detect_shift(prev: &[String], curr: &[String]) -> Option<usize> {
+    let n = prev.len().min(curr.len());
+    if n < 2 {
+        return None;
+    }
+    for k in 1..n {
+        if prev[k..n] == curr[..n - k] {
+            // Skip the case where everything that scrolled out is blank —
+            // it's noise from spinner / cursor tweaks on otherwise empty rows.
+            if prev[..k].iter().all(|r| r.trim().is_empty()) {
+                return None;
+            }
+            return Some(k);
+        }
+    }
+    None
 }
 
 /// Largest bounding box: pane size = max cols and max rows across all

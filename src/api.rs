@@ -58,21 +58,31 @@ pub async fn scrollback(
     let lines: u32 = q
         .get("lines")
         .and_then(|s| s.parse().ok())
-        .filter(|n: &u32| *n > 0 && *n <= 20_000)
-        .unwrap_or(2000);
+        .filter(|n: &u32| *n > 0 && *n <= 50_000)
+        .unwrap_or(4000);
     let session = match state.registry.get(&id).await {
         Some(s) => s,
         None => return (StatusCode::NOT_FOUND, format!("no session '{}'", id)).into_response(),
     };
-    match session.capture_tail(lines).await {
-        Ok(text) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            text,
-        )
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    // Combined history: rows captured by our shift-detection (true scroll-out
+    // history including alt-screen content) followed by the current visible
+    // pane. Together they give the full timeline.
+    let history = session.history_text(lines as usize).await;
+    let current = session.capture_tail(lines).await.unwrap_or_default();
+    let mut out = String::new();
+    if !history.is_empty() {
+        out.push_str(&history);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
     }
+    out.push_str(&current);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        out,
+    )
+        .into_response()
 }
 
 pub async fn delete_session(
