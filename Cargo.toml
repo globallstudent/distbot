@@ -1,0 +1,20 @@
+[package]
+name = "disbot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+axum = { version = "0.8.9", features = ["ws", "macros"] }
+bytes = "1.11.1"
+futures-util = "0.3.32"
+nix = { version = "0.31.2", features = ["term", "fs", "signal"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+strip-ansi-escapes = "0.2.1"
+teloxide = { version = "0.17.0", features = ["macros"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.2", features = ["full"] }
+tower-http = { version = "0.6.8", features = ["fs", "trace", "cors"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

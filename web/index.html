@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>disbot</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>
+  :root {
+    --bg: #0c0c0c;
+    --panel: #161616;
+    --panel-2: #202020;
+    --border: #2a2a2a;
+    --text: #e6e6e6;
+    --muted: #888;
+    --accent: #7fdb73;
+    --accent-2: #d97757;
+    --active: #2a3a55;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; overflow: hidden; }
+  #term { position: absolute; inset: 0; padding: 6px; }
+  #term .xterm { height: 100%; }
+  #status {
+    position: fixed; right: 10px; top: 8px; z-index: 30;
+    font: 11px ui-monospace, monospace;
+    color: var(--muted); background: rgba(0,0,0,0.55); padding: 2px 6px; border-radius: 3px;
+    pointer-events: none;
+  }
+
+  #picker {
+    position: fixed; bottom: 8px; right: 8px; z-index: 40;
+    display: inline-flex; gap: 6px; align-items: center;
+  }
+  .corner-btn {
+    background: rgba(20,20,20,0.85); color: var(--text);
+    border: 1px solid var(--border); border-radius: 999px;
+    padding: 5px 10px; font: 12px ui-monospace, "SF Mono", Menlo, monospace;
+    cursor: pointer; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  }
+  .corner-btn:hover { background: rgba(40,40,40,0.95); }
+  #hist-btn { padding: 5px 9px; }
+  #pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    max-width: 60vw;
+  }
+  #pill .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #pill .chev { font-size: 9px; opacity: 0.6; }
+  #pill.empty { color: var(--accent); }
+
+  #menu {
+    position: absolute; bottom: calc(100% + 6px); right: 0;
+    min-width: 260px; max-width: 380px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; box-shadow: 0 -8px 28px rgba(0,0,0,0.55);
+    padding: 4px; max-height: 60vh; overflow-y: auto;
+  }
+  .item {
+    display: flex; align-items: center; gap: 8px;
+    width: 100%; text-align: left; background: transparent; border: 0; color: var(--text);
+    padding: 7px 10px; border-radius: 5px; cursor: pointer;
+    font: 13px ui-sans-serif, system-ui;
+  }
+  .item:hover { background: var(--panel-2); }
+  .item.active { background: var(--active); }
+  .item .col { flex: 1; min-width: 0; }
+  .item .name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .item .cwd {
+    display: block; font-size: 11px; color: var(--muted);
+    font-family: ui-monospace, monospace;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px;
+  }
+  .item .del {
+    border: 0; background: transparent; color: var(--muted); cursor: pointer;
+    padding: 2px 6px; border-radius: 3px; opacity: 0; flex-shrink: 0;
+  }
+  .item:hover .del { opacity: 0.6; }
+  .item .del:hover { color: var(--accent-2); background: var(--bg); opacity: 1; }
+  .sep { height: 1px; background: var(--border); margin: 4px 2px; }
+  .item.new { color: var(--accent); font-weight: 500; }
+  .empty { color: var(--muted); padding: 10px 10px 6px; font-size: 12px; line-height: 1.4; }
+
+  dialog#new-modal {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px 18px; min-width: 380px;
+  }
+  dialog::backdrop { background: rgba(0,0,0,0.6); }
+  dialog h2 { margin: 0 0 12px; font-size: 14px; }
+  dialog label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+  dialog input {
+    width: 100%; padding: 6px 8px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px; font-family: ui-monospace, monospace;
+    font-size: 13px;
+  }
+  dialog input:focus { outline: 1px solid var(--accent); }
+  dialog .actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+  dialog button {
+    padding: 6px 12px; border-radius: 4px; border: 1px solid var(--border);
+    background: transparent; color: var(--text); cursor: pointer; font-size: 12px;
+  }
+  dialog button.primary { background: var(--accent); color: #0a0a0a; border-color: var(--accent); }
+  dialog button.primary:hover { filter: brightness(1.1); }
+  dialog button:hover { background: var(--panel-2); }
+  #err { color: var(--accent-2); font-size: 12px; margin-top: 8px; min-height: 16px; }
+
+  #hist-view {
+    position: fixed; inset: 0; z-index: 60; background: var(--bg);
+    display: flex; flex-direction: column;
+  }
+  #hist-view[hidden] { display: none; }
+  #hist-bar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+    background: var(--panel); flex-shrink: 0;
+  }
+  #hist-bar h2 { margin: 0; font-size: 13px; font-weight: 500; }
+  #hist-bar .info { color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; flex: 1; }
+  #hist-pre {
+    flex: 1; margin: 0; padding: 14px 18px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px; line-height: 1.4;
+    color: var(--text); background: var(--bg); white-space: pre;
+    overflow: auto; tab-size: 4;
+  }
+  #hist-bar button {
+    padding: 5px 12px; border-radius: 4px; border: 1px solid var(--border);
+    background: transparent; color: var(--text); cursor: pointer; font-size: 12px;
+  }
+  #hist-bar button:hover { background: var(--panel-2); }
+</style>
+</head>
+<body>
+<div id="picker">
+  <button id="hist-btn" class="corner-btn" type="button" title="show scrollback">↑</button>
+  <button id="pill" class="corner-btn" type="button" aria-haspopup="true" aria-expanded="false">
+    <span class="name" id="pill-name">…</span>
+    <span class="chev">▾</span>
+  </button>
+  <div id="menu" hidden></div>
+</div>
+<div id="status">connecting…</div>
+<div id="term"></div>
+
+<div id="hist-view" hidden>
+  <div id="hist-bar">
+    <h2 id="hist-title">scrollback</h2>
+    <span class="info" id="hist-info"></span>
+    <button id="hist-reload" type="button" title="reload">↻ reload</button>
+    <button id="hist-close" type="button">✕ close (esc)</button>
+  </div>
+  <pre id="hist-pre">loading…</pre>
+</div>
+
+<dialog id="new-modal">
+  <h2>new session</h2>
+  <form id="new-form" method="dialog">
+    <label>id <span style="color:var(--muted)">(a-z, 0-9, -, _)</span></label>
+    <input name="id" required autocomplete="off" pattern="[a-zA-Z0-9_-]{1,64}">
+    <label>command <span style="color:var(--muted)">(blank = shell)</span></label>
+    <input name="cmd" autocomplete="off" placeholder="leave blank for shell, e.g. claude">
+    <div id="err"></div>
+    <div class="actions">
+      <button type="button" id="cancel-btn">cancel</button>
+      <button type="submit" class="primary">create</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  let token = params.get('token');
+  if (!token) token = prompt('access token?') || '';
+
+  const statusEl = document.getElementById('status');
+  const pill = document.getElementById('pill');
+  const pillName = document.getElementById('pill-name');
+  const menu = document.getElementById('menu');
+  const modal = document.getElementById('new-modal');
+  const newForm = document.getElementById('new-form');
+  const cancelBtn = document.getElementById('cancel-btn');
+  const errEl = document.getElementById('err');
+  const histBtn = document.getElementById('hist-btn');
+  const histView = document.getElementById('hist-view');
+  const histPre = document.getElementById('hist-pre');
+  const histTitle = document.getElementById('hist-title');
+  const histInfo = document.getElementById('hist-info');
+  const histReload = document.getElementById('hist-reload');
+  const histClose = document.getElementById('hist-close');
+
+  const setStatus = (s, color = '#888') => {
+    statusEl.style.color = color;
+    statusEl.textContent = s;
+  };
+
+  const term = new Terminal({
+    fontFamily: '"SF Mono", Menlo, Monaco, "Courier New", monospace',
+    fontSize: 13,
+    lineHeight: 1.0,
+    cursorBlink: true,
+    allowProposedApi: true,
+    scrollback: 5000,
+    theme: {
+      background: '#0c0c0c',
+      foreground: '#e6e6e6',
+      cursor: '#e6e6e6',
+      selectionBackground: '#3d3d3d',
+    },
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.loadAddon(new WebLinksAddon.WebLinksAddon());
+  term.open(document.getElementById('term'));
+  fit.fit();
+
+  let ws = null;
+  let currentId = null;
+  let attachedId = null;
+  let knownSessions = [];
+  let menuOpen = false;
+
+  const readHashId = () => {
+    const m = location.hash.match(/id=([^&]+)/);
+    return m ? decodeURIComponent(m[1]) : null;
+  };
+  const setHashId = id => {
+    history.replaceState(null, '', id ? `#id=${encodeURIComponent(id)}` : '#');
+  };
+
+  async function api(method, path, body) {
+    const url = `/api${path}?token=${encodeURIComponent(token)}`;
+    const opts = { method };
+    if (body) {
+      opts.headers = { 'Content-Type': 'application/json' };
+      opts.body = JSON.stringify(body);
+    }
+    const r = await fetch(url, opts);
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`${r.status}: ${t || r.statusText}`);
+    }
+    return r.status === 204 ? null : await r.json();
+  }
+
+  function setMenuOpen(open) {
+    menuOpen = open;
+    menu.hidden = !open;
+    pill.setAttribute('aria-expanded', String(open));
+  }
+
+  function renderPill() {
+    if (currentId) {
+      pill.classList.remove('empty');
+      pillName.textContent = currentId;
+    } else {
+      pill.classList.add('empty');
+      pillName.textContent = '+ new session';
+    }
+  }
+
+  function renderMenu() {
+    menu.innerHTML = '';
+    if (knownSessions.length === 0) {
+      const e = document.createElement('div');
+      e.className = 'empty';
+      e.textContent = 'no sessions yet';
+      menu.appendChild(e);
+    } else {
+      for (const s of knownSessions) {
+        const it = document.createElement('button');
+        it.type = 'button';
+        it.className = 'item' + (s.id === currentId ? ' active' : '');
+        it.dataset.id = s.id;
+        const col = document.createElement('div');
+        col.className = 'col';
+        const name = document.createElement('div');
+        name.className = 'name';
+        name.textContent = s.id;
+        const cwd = document.createElement('div');
+        cwd.className = 'cwd';
+        cwd.textContent = s.cwd;
+        col.appendChild(name);
+        col.appendChild(cwd);
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'del';
+        del.title = 'kill session';
+        del.textContent = '✕';
+        del.addEventListener('click', e => { e.stopPropagation(); killSession(s.id); });
+        it.appendChild(col);
+        it.appendChild(del);
+        it.addEventListener('click', () => { selectSession(s.id); setMenuOpen(false); });
+        menu.appendChild(it);
+      }
+      const sep = document.createElement('div');
+      sep.className = 'sep';
+      menu.appendChild(sep);
+    }
+    const newItem = document.createElement('button');
+    newItem.type = 'button';
+    newItem.className = 'item new';
+    newItem.textContent = '+ new session';
+    newItem.addEventListener('click', () => { setMenuOpen(false); openNewModal(); });
+    menu.appendChild(newItem);
+  }
+
+  async function refreshSessions() {
+    try {
+      knownSessions = await api('GET', '/sessions');
+    } catch (e) {
+      setStatus('api: ' + e.message, '#d97757');
+      return;
+    }
+    if (knownSessions.length === 0) {
+      currentId = null;
+      setHashId(null);
+      closeWs();
+      term.reset();
+      term.write('\r\n  no sessions. click  + new session  to create one.\r\n');
+      setStatus('no session', '#888');
+      renderPill();
+      if (menuOpen) renderMenu();
+      return;
+    }
+    let target = currentId;
+    if (!target) target = readHashId();
+    if (!target || !knownSessions.find(s => s.id === target)) {
+      target = knownSessions[0].id;
+    }
+    if (target !== currentId || target !== attachedId) {
+      selectSession(target);
+    } else {
+      renderPill();
+      if (menuOpen) renderMenu();
+    }
+  }
+
+  function selectSession(id) {
+    currentId = id;
+    setHashId(id);
+    renderPill();
+    if (menuOpen) renderMenu();
+    attachWs(id);
+  }
+
+  function closeWs() {
+    if (ws) {
+      try { ws.close(); } catch (_) {}
+      ws = null;
+    }
+    attachedId = null;
+  }
+
+  function attachWs(id) {
+    closeWs();
+    attachedId = id;
+    term.reset();
+    fit.fit();
+    const u = new URL('/ws', location.href);
+    u.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    u.searchParams.set('token', token);
+    u.searchParams.set('id', id);
+    u.searchParams.set('cols', term.cols);
+    u.searchParams.set('rows', term.rows);
+    ws = new WebSocket(u);
+    ws.binaryType = 'arraybuffer';
+    ws.addEventListener('open', () => {
+      setStatus(id + ' · connected', '#7fdb73');
+      ws.send(JSON.stringify({ t: 'r', c: term.cols, r: term.rows }));
+      term.focus();
+    });
+    ws.addEventListener('close', e => setStatus(id + ' · closed (' + e.code + ')', '#d97757'));
+    ws.addEventListener('error', () => setStatus(id + ' · error', '#d97757'));
+    ws.addEventListener('message', ev => {
+      if (ev.data instanceof ArrayBuffer) term.write(new Uint8Array(ev.data));
+    });
+  }
+
+  term.onData(d => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ t: 'i', d }));
+    }
+  });
+
+  let resizeTimer = 0;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      fit.fit();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ t: 'r', c: term.cols, r: term.rows }));
+      }
+    }, 80);
+  });
+
+  async function killSession(id) {
+    if (!confirm(`kill session "${id}"?`)) return;
+    try {
+      await api('DELETE', `/sessions/${encodeURIComponent(id)}`);
+    } catch (e) {
+      alert('delete failed: ' + e.message);
+      return;
+    }
+    if (currentId === id) currentId = null;
+    await refreshSessions();
+  }
+
+  function openNewModal() {
+    errEl.textContent = '';
+    newForm.reset();
+    modal.showModal();
+    newForm.id.focus();
+  }
+
+  pill.addEventListener('click', () => {
+    if (knownSessions.length === 0 && !currentId) {
+      openNewModal();
+      return;
+    }
+    if (menuOpen) {
+      setMenuOpen(false);
+    } else {
+      renderMenu();
+      setMenuOpen(true);
+    }
+  });
+  document.addEventListener('click', e => {
+    if (!menuOpen) return;
+    if (e.target.closest('#picker')) return;
+    setMenuOpen(false);
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && menuOpen) setMenuOpen(false);
+  });
+
+  cancelBtn.addEventListener('click', () => modal.close());
+  newForm.addEventListener('submit', async ev => {
+    ev.preventDefault();
+    errEl.textContent = '';
+    const data = new FormData(newForm);
+    const id = String(data.get('id') || '').trim();
+    const cmdRaw = String(data.get('cmd') || '').trim();
+    const body = { id };
+    if (cmdRaw) body.cmd = cmdRaw;
+    try {
+      const created = await api('POST', '/sessions', body);
+      modal.close();
+      knownSessions = await api('GET', '/sessions');
+      selectSession(created.id);
+    } catch (e) {
+      errEl.textContent = e.message;
+    }
+  });
+
+  async function loadScrollback() {
+    if (!currentId) return;
+    histTitle.textContent = `scrollback · ${currentId}`;
+    histInfo.textContent = 'loading…';
+    histPre.textContent = '';
+    try {
+      const url = `/api/sessions/${encodeURIComponent(currentId)}/scrollback?token=${encodeURIComponent(token)}&lines=4000`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+      const text = await r.text();
+      histPre.textContent = text || '(empty)';
+      const lineCount = (text.match(/\n/g) || []).length + 1;
+      histInfo.textContent = `${lineCount} lines · ${text.length.toLocaleString()} chars`;
+      requestAnimationFrame(() => { histPre.scrollTop = histPre.scrollHeight; });
+    } catch (e) {
+      histPre.textContent = 'error: ' + e.message;
+      histInfo.textContent = '';
+    }
+  }
+  function showHist() {
+    if (!currentId) return;
+    histView.hidden = false;
+    histClose.focus();
+    loadScrollback();
+  }
+  function hideHist() {
+    histView.hidden = true;
+    term.focus();
+  }
+  histBtn.addEventListener('click', showHist);
+  histClose.addEventListener('click', hideHist);
+  histReload.addEventListener('click', loadScrollback);
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !histView.hidden) {
+      e.preventDefault();
+      hideHist();
+    }
+  });
+
+  refreshSessions();
+  setInterval(refreshSessions, 5000);
+})();
+</script>
+</body>
+</html>
