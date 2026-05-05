@@ -7,11 +7,11 @@ mod ws;
 
 use anyhow::Result;
 use axum::{
-    extract::{Query, State, WebSocketUpgrade},
+    extract::{DefaultBodyLimit, Query, State, WebSocketUpgrade},
     http::{header, StatusCode},
     middleware,
     response::{Html, IntoResponse},
-    routing::{delete, get},
+    routing::{delete, get, post},
     Router,
 };
 use serde::Deserialize;
@@ -86,6 +86,10 @@ async fn main() -> Result<()> {
         .route("/sessions", get(api::list_sessions).post(api::create_session))
         .route("/sessions/{id}", delete(api::delete_session))
         .route("/sessions/{id}/scrollback", get(api::scrollback))
+        .route(
+            "/upload",
+            post(api::upload).layer(DefaultBodyLimit::max(20 * 1024 * 1024)),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             api::auth_middleware,

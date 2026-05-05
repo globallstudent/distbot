@@ -1,6 +1,7 @@
 use crate::registry::SessionMeta;
 use crate::AppState;
 use axum::{
+    body::Bytes,
     extract::{Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::Next,
@@ -9,7 +10,12 @@ use axum::{
 };
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static UPLOAD_SEQ: AtomicU64 = AtomicU64::new(1);
+const UPLOAD_MAX: usize = 20 * 1024 * 1024;
 
 #[derive(Deserialize)]
 pub struct CreateReq {
@@ -76,6 +82,47 @@ pub async fn delete_session(
     match state.registry.delete(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+pub async fn upload(headers: HeaderMap, body: Bytes) -> Response {
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty body").into_response();
+    }
+    if body.len() > UPLOAD_MAX {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "max 20 MB").into_response();
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let ext = ext_for_mime(content_type);
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = UPLOAD_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::path::Path::new("/tmp/disbot-uploads");
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}")).into_response();
+    }
+    let path = dir.join(format!("paste-{ms}-{seq}.{ext}"));
+    if let Err(e) = tokio::fs::write(&path, &body).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")).into_response();
+    }
+    Json(serde_json::json!({ "path": path.display().to_string() })).into_response()
+}
+
+fn ext_for_mime(mime: &str) -> &'static str {
+    match mime.split(';').next().unwrap_or("").trim() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/avif" => "avif",
+        "image/heic" | "image/heif" => "heic",
+        "image/svg+xml" => "svg",
+        _ => "bin",
     }
 }
 

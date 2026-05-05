@@ -123,6 +123,8 @@
     font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px; line-height: 1.4;
     color: var(--text); background: var(--bg); white-space: pre;
     overflow: auto; tab-size: 4;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
   }
   #hist-bar button {
     padding: 5px 12px; border-radius: 4px; border: 1px solid var(--border);
@@ -164,12 +166,14 @@
 <body>
 <div id="picker">
   <button id="hist-btn" class="corner-btn" type="button" title="show scrollback">↑</button>
+  <button id="paste-btn" class="corner-btn" type="button" title="paste image">📎</button>
   <button id="pill" class="corner-btn" type="button" aria-haspopup="true" aria-expanded="false">
     <span class="name" id="pill-name">…</span>
     <span class="chev">▾</span>
   </button>
   <div id="menu" hidden></div>
 </div>
+<input id="paste-file" type="file" accept="image/*" multiple hidden>
 <div id="status">connecting…</div>
 <div id="term"></div>
 
@@ -475,34 +479,204 @@
     term.focus();
   });
 
-  // Manual touch scroll for xterm. xterm.js doesn't ship native touch
-  // scrolling, so on phones a swipe does nothing (or scrolls the page,
-  // which we've disabled). We translate touchmove deltas into
-  // term.scrollLines() so the buffer scrolls. Effective for shell sessions;
-  // alt-screen apps (Claude TUI) have no scrollback so this is a no-op there.
+  // Image paste pipeline: upload each blob to /api/upload, get a temp file
+  // path back, type `@<path> ` into the terminal so Claude can reference it.
+  async function uploadBlob(blob, idx, total) {
+    if (!blob) return false;
+    const label = total > 1 ? `uploading ${idx}/${total}…` : 'uploading image…';
+    setStatus(label, '#888');
+    try {
+      const r = await fetch(`/api/upload?token=${encodeURIComponent(token)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': blob.type || 'application/octet-stream' },
+        body: blob,
+      });
+      if (!r.ok) {
+        setStatus('upload failed: ' + r.status, '#d97757');
+        return false;
+      }
+      const { path } = await r.json();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ t: 'i', d: `@${path} ` }));
+      }
+      return true;
+    } catch (err) {
+      setStatus('upload error: ' + err.message, '#d97757');
+      return false;
+    }
+  }
+  async function uploadMany(blobs) {
+    const list = Array.from(blobs).filter(Boolean);
+    if (list.length === 0) return;
+    let ok = 0;
+    for (let i = 0; i < list.length; i++) {
+      if (await uploadBlob(list[i], i + 1, list.length)) ok++;
+    }
+    if (ok > 0) {
+      setStatus(`pasted ${ok} image${ok === 1 ? '' : 's'}`, '#7fdb73');
+      term.focus();
+    }
+  }
+
+  // Path 1: desktop Cmd+V — the paste event still fires, capture all images.
+  document.addEventListener('paste', async e => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const blobs = [];
+    for (const item of items) {
+      if (item.type && item.type.startsWith('image/')) {
+        const f = item.getAsFile();
+        if (f) blobs.push(f);
+      }
+    }
+    if (blobs.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    await uploadMany(blobs);
+  }, true);
+
+  // Path 2: dedicated paste button. On Android the system blocks paste into
+  // text-only inputs, so we use navigator.clipboard.read() (explicit API,
+  // permission-gated) and fall back to a file picker if nothing is found.
+  // The file picker accepts multiple selections.
+  const pasteBtn = document.getElementById('paste-btn');
+  const pasteFile = document.getElementById('paste-file');
+  async function tryClipboardImages() {
+    if (!navigator.clipboard || !navigator.clipboard.read) return [];
+    try {
+      const items = await navigator.clipboard.read();
+      const blobs = [];
+      for (const item of items) {
+        for (const type of item.types) {
+          if (type.startsWith('image/')) {
+            blobs.push(await item.getType(type));
+          }
+        }
+      }
+      return blobs;
+    } catch (_) {
+      return [];
+    }
+  }
+  pasteBtn.addEventListener('click', async () => {
+    const blobs = await tryClipboardImages();
+    if (blobs.length > 0) {
+      await uploadMany(blobs);
+    } else {
+      pasteFile.click();
+    }
+  });
+  pasteFile.addEventListener('change', async () => {
+    if (pasteFile.files && pasteFile.files.length > 0) {
+      await uploadMany(pasteFile.files);
+    }
+    pasteFile.value = '';
+  });
+
+  // Mobile touch scroll for the live terminal.
+  //
+  // Two concerns:
+  //   1. xterm.js does not ship a touch-scroll gesture handler. We synthesize
+  //      one by translating touch dy into term.scrollLines.
+  //   2. xterm.js attaches its own touch listeners (selection); we use
+  //      capture-phase listeners so we always run first.
+  //
+  // For alt-screen apps (Claude TUI), term.scrollLines is a no-op because
+  // alt-screen has no scrollback. We detect a meaningful upward swipe in
+  // alt-screen mode and open the scrollback view instead — the only thing
+  // that *can* show history at that point.
   const termEl = document.getElementById('term');
   let touchY = null;
+  let touchStartY = null;
+  let touchStartT = 0;
   let touchAccum = 0;
+  let lastDy = 0;
+  let lastDt = 16;
   const rowPx = 14;
+  let momentumRaf = 0;
+
+  function inAltScreen() {
+    try { return term.buffer.active.type === 'alternate'; } catch (_) { return false; }
+  }
+  function cancelMomentum() {
+    if (momentumRaf) { cancelAnimationFrame(momentumRaf); momentumRaf = 0; }
+  }
+  function startMomentum() {
+    if (inAltScreen()) return;
+    if (Math.abs(lastDy / Math.max(lastDt, 8)) < 0.15) return;
+    let v = lastDy / Math.max(lastDt, 8); // px per ms
+    const decay = 0.93;
+    let prev = performance.now();
+    const tick = now => {
+      const dt = Math.min(50, now - prev);
+      prev = now;
+      touchAccum += v * dt;
+      const lines = Math.trunc(touchAccum / rowPx);
+      if (lines !== 0) {
+        term.scrollLines(lines);
+        touchAccum -= lines * rowPx;
+      }
+      v *= decay;
+      if (Math.abs(v) > 0.05) {
+        momentumRaf = requestAnimationFrame(tick);
+      } else {
+        momentumRaf = 0;
+      }
+    };
+    momentumRaf = requestAnimationFrame(tick);
+  }
+
   termEl.addEventListener('touchstart', e => {
-    if (e.touches.length === 1) {
-      touchY = e.touches[0].clientY;
-      touchAccum = 0;
-    }
-  }, { passive: true });
+    if (e.touches.length !== 1) return;
+    cancelMomentum();
+    touchY = e.touches[0].clientY;
+    touchStartY = touchY;
+    touchStartT = performance.now();
+    touchAccum = 0;
+    lastDy = 0;
+    lastDt = 16;
+  }, { capture: true, passive: true });
+
   termEl.addEventListener('touchmove', e => {
     if (e.touches.length !== 1 || touchY === null) return;
     const y = e.touches[0].clientY;
-    touchAccum += touchY - y;
-    const lines = Math.trunc(touchAccum / rowPx);
-    if (lines !== 0) {
-      term.scrollLines(lines);
-      touchAccum -= lines * rowPx;
+    const now = performance.now();
+    const dy = touchY - y;
+    lastDy = dy;
+    lastDt = Math.max(1, now - (touchStartT + (touchStartT === now ? 0 : 0)));
+    if (!inAltScreen()) {
+      touchAccum += dy;
+      const lines = Math.trunc(touchAccum / rowPx);
+      if (lines !== 0) {
+        term.scrollLines(lines);
+        touchAccum -= lines * rowPx;
+      }
     }
     touchY = y;
-  }, { passive: true });
-  termEl.addEventListener('touchend', () => { touchY = null; });
-  termEl.addEventListener('touchcancel', () => { touchY = null; });
+  }, { capture: true, passive: true });
+
+  termEl.addEventListener('touchend', e => {
+    if (touchY === null || touchStartY === null) {
+      touchY = null; touchStartY = null;
+      return;
+    }
+    const totalDy = touchStartY - (e.changedTouches[0]?.clientY ?? touchY);
+    const totalDt = performance.now() - touchStartT;
+    touchY = null;
+    // In alt-screen, a clear swipe-up gesture opens the scrollback view —
+    // the only place we can show history when xterm has no scrollback.
+    if (inAltScreen() && totalDy > 80 && totalDt < 700 && currentId) {
+      showHist();
+      touchStartY = null;
+      return;
+    }
+    touchStartY = null;
+    startMomentum();
+  }, { capture: true, passive: true });
+
+  termEl.addEventListener('touchcancel', () => {
+    touchY = null; touchStartY = null;
+  }, { capture: true, passive: true });
 
   // Lift the keybar above the on-screen keyboard. We try the modern
   // CSS approach first (interactive-widget=resizes-content in the viewport
